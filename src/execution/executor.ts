@@ -173,9 +173,46 @@ function failureDiagnostic(error: CommandFailureError): Record<string, unknown> 
     expectedExitCodes: error.expectedExitCodes,
     signal: error.signal,
     timedOut: error.timedOut,
+    truncated: error.truncated,
     stdoutTail: error.stdoutTail ?? null,
     stderrTail: error.stderrTail ?? null,
   };
+}
+
+/**
+ * Structural validation of a cached `run_command` result before it is ever
+ * returned from `checkCache`'s "completed" skip path. The repository layer
+ * already rejects a non-object/array/scalar payload (see
+ * `Repository.getIdempotencyState`), but that check has no notion of what
+ * a *run_command* result specifically looks like — a valid-but-wrong object
+ * (e.g. a write_file result `{path: "..."}`, or a hand-tampered row) would
+ * otherwise sail through as a "completed" cache hit and get handed back as
+ * a fabricated `CommandResult`. This is the second, kind-specific gate.
+ */
+function isValidCommandResult(value: unknown): value is CommandResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const v = value as Record<string, unknown>;
+  const exitCodeOk =
+    v.exitCode === null ||
+    (typeof v.exitCode === "number" && Number.isInteger(v.exitCode));
+  const signalOk = v.signal === null || typeof v.signal === "string";
+  const stdoutOk = typeof v.stdout === "string";
+  const stderrOk = typeof v.stderr === "string";
+  const truncatedOk = !("truncated" in v) || typeof v.truncated === "boolean";
+  const timedOutOk = !("timedOut" in v) || typeof v.timedOut === "boolean";
+  return (
+    exitCodeOk && signalOk && stdoutOk && stderrOk && truncatedOk && timedOutOk
+  );
+}
+
+/** Same idea as {@link isValidCommandResult}, for a cached `write_file` result. */
+function isValidWriteFileResult(value: unknown): value is { path: string } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  return typeof (value as Record<string, unknown>).path === "string";
 }
 
 export interface ExecutorOptions {
@@ -243,6 +280,8 @@ export class Executor {
       "write_file",
       relPath,
       taskId,
+      "low",
+      isValidWriteFileResult,
     );
     if (cached.skip) return;
 
@@ -323,10 +362,16 @@ export class Executor {
       command,
       taskId,
       classification.risk,
+      isValidCommandResult,
     );
     if (cached.skip)
+      // `cached.result` is guaranteed defined and valid here: checkCache
+      // only sets `skip: true` for a "completed" row after `isValidResult`
+      // (isValidCommandResult) has already passed. The fallback object
+      // exists purely as defense-in-depth, not because it's expected to
+      // ever be reached.
       return (
-        (cached.result as CommandResult) ?? {
+        cached.result ?? {
           exitCode: null,
           signal: null,
           stdout: "",
@@ -375,6 +420,7 @@ export class Executor {
         expectedExitCodes: normalizedExpectedExitCodes,
         signal: null,
         timedOut: false,
+        truncated: false,
         runId: this.runId,
         taskId,
       });
@@ -430,6 +476,7 @@ export class Executor {
           expectedExitCodes: normalizedExpectedExitCodes,
           signal: null,
           timedOut: false,
+          truncated: false,
           runId: this.runId,
           taskId,
         },
@@ -474,6 +521,7 @@ export class Executor {
         expectedExitCodes: normalizedExpectedExitCodes,
         signal: result.signal,
         timedOut: result.timedOut ?? false,
+        truncated: result.truncated ?? false,
         runId: this.runId,
         taskId,
         stdoutTail: result.stdout,
@@ -512,21 +560,33 @@ export class Executor {
     return assertWorkspaceRootValid(this.workspaceRoot);
   }
 
-  private checkCache(
+  /**
+   * @param isValidResult Structural validator for this action kind's cached
+   * result (see {@link isValidCommandResult}/{@link isValidWriteFileResult}).
+   * A "completed" row whose persisted result fails this check is never
+   * trusted as a cache hit — it falls through to the exact same handling as
+   * an unknown-outcome "attempted" row below (including forced approval for
+   * destructive/network risk), rather than being skipped or thrown on.
+   */
+  private checkCache<T>(
     key: string,
     kind: "write_file" | "run_command",
     subject: string,
     taskId: string,
     risk: CommandRisk = "low",
+    isValidResult?: (value: unknown) => value is T,
   ): {
     skip: boolean;
-    result?: unknown;
+    result?: T;
     requiresApprovalBeforeRetry?: boolean;
   } {
     const state = this.repository.getIdempotencyState(key);
     if (!state) return { skip: false };
 
-    if (state.status === "completed") {
+    if (
+      state.status === "completed" &&
+      (!isValidResult || isValidResult(state.result))
+    ) {
       this.events.emit({
         runId: this.runId,
         taskId,
@@ -535,7 +595,7 @@ export class Executor {
           message: `skip (already applied): ${kind === "write_file" ? `write ${subject}` : subject}`,
         },
       });
-      return { skip: true, result: state.result };
+      return { skip: true, result: state.result as T };
     }
 
     // status === "failed": a previous attempt ran to a *known* conclusion
@@ -547,8 +607,11 @@ export class Executor {
       return { skip: false };
     }
 
-    // status === "attempted": a previous run started this and we never
-    // learned the outcome (crash, kill -9, power loss). Re-running a
+    // status === "attempted" (a previous run started this and we never
+    // learned the outcome: crash, kill -9, power loss), OR a "completed"
+    // row whose persisted result didn't pass `isValidResult` above
+    // (corruption, tampering, or a cross-kind/hash-collision mismatch) —
+    // both are treated identically as an unknown outcome. Re-running a
     // read-only/low-risk action is safe; re-running something classified
     // destructive/network could double-charge, double-post, or double-delete.
     if (UNSAFE_TO_BLINDLY_RETRY.has(risk)) {

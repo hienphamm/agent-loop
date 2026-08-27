@@ -372,6 +372,7 @@ async function runTaskWithRetry(
               expectedExitCodes: error.expectedExitCodes,
               signal: error.signal,
               timedOut: error.timedOut,
+              truncated: error.truncated,
             }
           : { code: display.code };
       if (

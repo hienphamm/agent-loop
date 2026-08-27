@@ -167,6 +167,31 @@ describe("Executor.runCommand exit-code semantics", () => {
     expect(failedEvent!.failureReason).toBe("TERMINATED_BY_SIGNAL");
   });
 
+  it("distinguishes an output-limit kill from an ordinary external signal/timeout", async () => {
+    const { executor, commandCompletedEvents } = makeExecutor({
+      maxOutputBytes: 100,
+      killGraceMs: 200,
+    });
+    // Writes far more than the 100-byte cap; the executor kills it for
+    // exceeding maxOutputBytes, not because of the (10-minute default)
+    // timeout and not because of some external signal.
+    const error = await executor
+      .runCommand("t1", "head -c 200000 /dev/zero")
+      .catch((e) => e as CommandFailureError);
+    expect(error).toBeInstanceOf(CommandFailureError);
+    // It resolves via signal (the kill mechanism), but must be marked
+    // `truncated` so it's not indistinguishable from an unrelated external
+    // kill — and must NOT be reported as a timeout.
+    expect((error as CommandFailureError).code).toBe("TERMINATED_BY_SIGNAL");
+    expect((error as CommandFailureError).truncated).toBe(true);
+    expect((error as CommandFailureError).timedOut).toBe(false);
+
+    const failedEvent = commandCompletedEvents.find(
+      (e) => e.success === false,
+    );
+    expect(failedEvent!.truncated).toBe(true);
+  }, 10_000);
+
   it("distinguishes a timeout from an unexpected exit code", async () => {
     const { executor } = makeExecutor({ timeoutMs: 50, killGraceMs: 50 });
     const error = await executor
@@ -174,6 +199,7 @@ describe("Executor.runCommand exit-code semantics", () => {
       .catch((e) => e as CommandFailureError);
     expect(error).toBeInstanceOf(CommandFailureError);
     expect((error as CommandFailureError).code).toBe("COMMAND_TIMEOUT");
+    expect((error as CommandFailureError).truncated).toBe(false);
   }, 10_000);
 
   it("reports a spawn failure distinctly, without pretending it was an exit code", async () => {
@@ -208,6 +234,36 @@ describe("Executor.runCommand exit-code semantics", () => {
     }
   });
 
+  it("does not leak a partial secret when its occurrence straddles the diagnostic truncation boundary", async () => {
+    // Regression for a truncate-before-redact ordering bug: redact() only
+    // matches a *complete* occurrence of a registered secret, so slicing
+    // the diagnostic down to its last 2000 characters before redacting
+    // could cut a secret in half at that boundary and leave the surviving
+    // fragment (e.g. the secret's last 20 characters) unredacted. Placing
+    // the secret so only its tail falls within the last-2000-char window
+    // reproduces exactly that boundary.
+    const secret = "S3CR3T-" + "9".repeat(33); // 40 chars, unique.
+    registerSecret(secret);
+    try {
+      const { executor } = makeExecutor();
+      const filler = "z".repeat(1980);
+      // secret(40) + filler(1980) = 2020 chars; the last 2000 keep only
+      // the secret's final 20 characters plus all of filler.
+      const payload = secret + filler;
+      const command = `printf '%s' '${payload}' 1>&2; exit 1`;
+      const error = await executor
+        .runCommand("t1", command)
+        .catch((e) => e as CommandFailureError);
+      expect(error).toBeInstanceOf(CommandFailureError);
+      const tail = (error as CommandFailureError).stderrTail ?? "";
+      expect(tail).not.toContain(secret);
+      // No fragment (rotating substring) of the secret survives either.
+      expect(tail).not.toContain(secret.slice(20));
+      expect(tail).not.toContain(secret.slice(-10));
+    } finally {
+      clearRegisteredSecrets();
+    }
+  });
 });
 
 describe("run_command idempotency", () => {
@@ -226,6 +282,33 @@ describe("run_command idempotency", () => {
       .catch((e) => e as CommandFailureError);
     expect(second).toBeInstanceOf(CommandFailureError);
     expect(getCommandStartedCount()).toBe(2);
+  });
+
+  it("does not skip execution for a corrupted 'completed' row with a NULL result_json", async () => {
+    // A "completed" row is only ever written together with a real
+    // result_json by recordIdempotentResult. Directly seed a corrupted row
+    // (status='completed', result_json=NULL) — as could arise from a torn
+    // write or tampering — bypassing Executor entirely, then prove
+    // Executor.runCommand does NOT treat it as a trustworthy cache hit: it
+    // must actually re-execute the command rather than returning the
+    // fabricated `{exitCode: null, ...}` fallback checkCache would produce
+    // for a blindly-trusted "completed" skip.
+    const { executor, repository, getCommandStartedCount } = makeExecutor();
+    const command = "exit 0";
+    const key = computeRunCommandIdempotencyKey("run-1", "t1", command, undefined);
+    const db = (repository as unknown as { db: import("node:sqlite").DatabaseSync })
+      .db;
+    db.prepare(
+      `INSERT INTO idempotency_keys (key, run_id, task_id, risk, status, result_json, created_at, updated_at)
+       VALUES (?, 'run-1', 't1', 'low', 'completed', NULL, 't', 't')`,
+    ).run(key);
+
+    expect(getCommandStartedCount()).toBe(0);
+    const result = await executor.runCommand("t1", command);
+    // A real execution happened (command_started fired) rather than a
+    // silent skip-with-fabricated-result.
+    expect(getCommandStartedCount()).toBe(1);
+    expect(result.exitCode).toBe(0);
   });
 
   it("(2)+(3) persists a known failure as 'failed' (not unknown 'attempted'), and a retry actually re-executes it without forcing approval", async () => {

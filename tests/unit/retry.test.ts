@@ -19,6 +19,7 @@ function commandFailure(reason: CommandFailureReason): CommandFailureError {
     expectedExitCodes: [0],
     signal: reason === "TERMINATED_BY_SIGNAL" ? "SIGTERM" : null,
     timedOut: reason === "COMMAND_TIMEOUT",
+    truncated: false,
     runId: "run-1",
     taskId: "t1",
   });

@@ -17,6 +17,7 @@ import { ApprovalGate } from "../../src/execution/approval.js";
 import {
   Executor,
   computeRunCommandIdempotencyKey,
+  computeWriteFileIdempotencyKey,
 } from "../../src/execution/executor.js";
 import { WorkspaceSafetyError } from "../../src/errors/index.js";
 
@@ -176,6 +177,83 @@ describe("Executor idempotency + retry safety", () => {
     expect(second).toEqual(first);
   });
 
+  it.each([
+    ["a bare scalar (false)", "false"],
+    ["a bare scalar (0)", "0"],
+    ["a bare JSON string", '"unrelated text"'],
+    ["an empty array", "[]"],
+    ["a valid-but-wrong-shape object (a write_file result)", '{"path":"x.txt"}'],
+  ])(
+    "does not skip run_command execution for a 'completed' row whose result_json is %s",
+    async (_label, jsonLiteral) => {
+      const workspace = makeWorkspace();
+      const { executor, repository } = makeExecutor(workspace);
+      const command = "echo hello-again";
+      const key = computeRunCommandIdempotencyKey(
+        "run-1",
+        "t1",
+        command,
+        undefined,
+      );
+      const db = (
+        repository as unknown as { db: import("node:sqlite").DatabaseSync }
+      ).db;
+      db.prepare(
+        `INSERT INTO idempotency_keys (key, run_id, task_id, risk, status, result_json, created_at, updated_at)
+         VALUES (?, 'run-1', 't1', 'low', 'completed', ?, 't', 't')`,
+      ).run(key, jsonLiteral);
+
+      // A real execution happens and returns a genuine CommandResult
+      // (stdout containing the echoed text), not the corrupted payload and
+      // not a fabricated `{exitCode: null, ...}` fallback.
+      const result = await executor.runCommand("t1", command);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("hello-again");
+    },
+  );
+
+  it.each([
+    ["a bare scalar (false)", "false"],
+    ["a bare scalar (0)", "0"],
+    ["a bare JSON string", '"unrelated text"'],
+    ["an empty array", "[]"],
+    [
+      "a valid-but-wrong-shape object (a run_command result)",
+      '{"exitCode":0,"signal":null,"stdout":"","stderr":""}',
+    ],
+  ])(
+    "does not skip write_file execution for a 'completed' row whose result_json is %s",
+    async (_label, jsonLiteral) => {
+      const workspace = makeWorkspace();
+      const { executor, repository } = makeExecutor(workspace);
+      const relPath = "corrupted-cache.txt";
+      const content = "real content";
+      const key = computeWriteFileIdempotencyKey(
+        "run-1",
+        "t1",
+        relPath,
+        content,
+      );
+      const db = (
+        repository as unknown as { db: import("node:sqlite").DatabaseSync }
+      ).db;
+      db.prepare(
+        `INSERT INTO idempotency_keys (key, run_id, task_id, risk, status, result_json, created_at, updated_at)
+         VALUES (?, 'run-1', 't1', 'low', 'completed', ?, 't', 't')`,
+      ).run(key, jsonLiteral);
+
+      expect(existsSync(path.join(workspace, relPath))).toBe(false);
+      await executor.writeFile("t1", relPath, content);
+      // A real write happened — the file now exists with the real content
+      // — rather than being silently skipped because a corrupted row
+      // claimed this exact write was already "completed".
+      const { readFileSync } = await import("node:fs");
+      expect(readFileSync(path.join(workspace, relPath), "utf8")).toBe(
+        content,
+      );
+    },
+  );
+
   it("requires a fresh (still-auto-approved-under-all, but explicitly re-approved) pass for a destructive command whose prior attempt never recorded an outcome", async () => {
     const workspace = makeWorkspace();
     const repository = new Repository(openInMemoryDatabase());
@@ -233,6 +311,60 @@ describe("Executor idempotency + retry safety", () => {
     });
     try {
       await executor.runCommand("t1", crashedCommand);
+    } finally {
+      unsubscribe();
+    }
+    expect(
+      messages.some((m) =>
+        m.includes("crashed before its outcome was recorded"),
+      ),
+    ).toBe(true);
+  }, 10_000);
+
+  it("still requires forced approval for a destructive command when its 'completed' cache row is corrupted (not just when it's 'attempted')", async () => {
+    const workspace = makeWorkspace();
+    const repository = new Repository(openInMemoryDatabase());
+    repository.createRun(
+      { id: "run-1", prompt: "p", workspace, status: "running" },
+      "{}",
+    );
+    const events = new EventBus();
+    const messages: string[] = [];
+    events.onType("progress", (e) => messages.push(String(e.data.message)));
+    const approvalGate = new ApprovalGate(repository, events, "all");
+    const executor = new Executor(
+      workspace,
+      "run-1",
+      repository,
+      events,
+      approvalGate,
+    );
+
+    // A "completed" row for a destructive command, but with a corrupted
+    // (bare-scalar) result_json that fails the run_command shape check —
+    // this must be downgraded to the same unknown-outcome handling as an
+    // "attempted" row, including the forced-approval retry path, not
+    // silently trusted (skip) nor silently auto-approved.
+    const command = "rm -rf some-tampered-dir";
+    const key = computeRunCommandIdempotencyKey(
+      "run-1",
+      "t1",
+      command,
+      undefined,
+    );
+    const db = (
+      repository as unknown as { db: import("node:sqlite").DatabaseSync }
+    ).db;
+    db.prepare(
+      `INSERT INTO idempotency_keys (key, run_id, task_id, risk, status, result_json, created_at, updated_at)
+       VALUES (?, 'run-1', 't1', 'destructive', 'completed', 'false', 't', 't')`,
+    ).run(key);
+
+    const unsubscribe = events.onType("approval_required", (e) => {
+      repository.resolveApproval(String(e.data.approvalId), "approved");
+    });
+    try {
+      await executor.runCommand("t1", command);
     } finally {
       unsubscribe();
     }

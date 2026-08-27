@@ -432,17 +432,59 @@ export class Repository {
       )
       .get(key) as
       | {
-          status: "attempted" | "completed" | "failed";
+          status: string;
           risk: string;
           result_json: string | null;
         }
       | undefined;
     if (!row) return undefined;
-    return {
-      status: row.status,
-      risk: row.risk,
-      result: row.result_json ? JSON.parse(row.result_json) : undefined,
-    };
+
+    // Defensive parsing, not just a type cast: `status` has no CHECK
+    // constraint (by design, see above), and `result_json` is arbitrary
+    // stored text. An unrecognized status, or a "completed" row whose
+    // result_json is missing/empty/malformed, must never be silently
+    // trusted as a verified success — that would let a corrupted or
+    // half-written row masquerade as a cached success and skip execution
+    // entirely (Executor.checkCache would return a fabricated fallback
+    // result instead of ever running the command). Both fall back to
+    // "attempted", reusing the existing crash-safe path (forced approval
+    // before blindly retrying a destructive/network-risk action) instead
+    // of throwing or guessing.
+    let result: unknown;
+    // "completed" is only ever trustworthy when result_json is present,
+    // parses successfully, *and* parses to a non-null, non-array object —
+    // NULL/absent, "", unparsable text, a stored `"null"`, and any bare
+    // scalar or array (`false`, `0`, `"text"`, `[]`, ...) are all treated
+    // the same: no usable result. Every real success Executor persists is
+    // a plain object (write_file stores `{path}`, run_command stores a
+    // CommandResult object) — never a bare scalar/array — so anything else
+    // can only be a corrupted/half-written/tampered row. "failed" rows
+    // don't need this guarantee (their result_json is diagnostic-only;
+    // checkCache never reads it to decide whether to skip execution).
+    let resultUsable = false;
+    if (row.result_json) {
+      try {
+        const parsed = JSON.parse(row.result_json) as unknown;
+        if (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          !Array.isArray(parsed)
+        ) {
+          result = parsed;
+          resultUsable = true;
+        }
+      } catch {
+        resultUsable = false;
+      }
+    }
+    const knownStatus =
+      row.status === "completed" || row.status === "failed";
+    const status: "attempted" | "completed" | "failed" =
+      knownStatus && !(row.status === "completed" && !resultUsable)
+        ? (row.status as "completed" | "failed")
+        : "attempted";
+
+    return { status, risk: row.risk, result };
   }
 
   /** Record that execution of this key has started, before it runs. */

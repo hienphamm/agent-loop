@@ -113,6 +113,18 @@ export interface CommandFailureDetails {
   expectedExitCodes: number[];
   signal: NodeJS.Signals | null;
   timedOut: boolean;
+  /**
+   * True when the process was killed for exceeding the output byte cap.
+   * This is independent of `reason`: hitting the output limit kills the
+   * process via `SIGTERM`/`SIGKILL` just like an external signal would, so
+   * without this flag a self-imposed output-limit kill is indistinguishable
+   * from `TERMINATED_BY_SIGNAL` caused by something else entirely (or, if
+   * the process happens to exit on its own right as the limit is enforced,
+   * from a plain `UNEXPECTED_EXIT_CODE`). Never true for `COMMAND_TIMEOUT`
+   * or `COMMAND_SPAWN_FAILED`, whose own reason already fully explains what
+   * happened.
+   */
+  truncated: boolean;
   runId: string;
   taskId: string;
   /** Bounded, unredacted tail of stdout — redacted internally before storage. */
@@ -124,21 +136,37 @@ export interface CommandFailureDetails {
 /** Bound on stdout/stderr kept in a CommandFailureError's diagnostic fields. */
 const MAX_DIAGNOSTIC_CHARS = 2000;
 
+/**
+ * Redact first, *then* truncate — never the other way around. Truncating
+ * before redacting can slice a registered secret in half at the truncation
+ * boundary: `redact()` only matches a *complete* occurrence of a known
+ * secret, so a truncated fragment (e.g. the last 10 characters of a 30-char
+ * token) would not match and would leak verbatim in the bounded output.
+ * Redacting the full text first replaces every complete occurrence with
+ * `[REDACTED]` regardless of where it falls, so truncating afterward can
+ * only ever cut through already-scrubbed placeholder text.
+ */
 function boundedRedacted(text: string | undefined): string | undefined {
   if (!text) return undefined;
-  const bounded =
-    text.length > MAX_DIAGNOSTIC_CHARS
-      ? text.slice(-MAX_DIAGNOSTIC_CHARS)
-      : text;
-  return redact(bounded);
+  const scrubbed = redact(text);
+  return scrubbed.length > MAX_DIAGNOSTIC_CHARS
+    ? scrubbed.slice(-MAX_DIAGNOSTIC_CHARS)
+    : scrubbed;
 }
 
 function describeFailure(details: CommandFailureDetails): string {
   switch (details.reason) {
     case "UNEXPECTED_EXIT_CODE":
-      return `exited with code ${details.actualExitCode} (expected one of [${details.expectedExitCodes.join(", ")}])`;
+      return (
+        `exited with code ${details.actualExitCode} (expected one of [${details.expectedExitCodes.join(", ")}])` +
+        (details.truncated
+          ? " — note: its output had already reached the configured limit before it exited"
+          : "")
+      );
     case "TERMINATED_BY_SIGNAL":
-      return `was terminated by signal ${details.signal}`;
+      return details.truncated
+        ? `was terminated by signal ${details.signal} after its output reached the configured limit`
+        : `was terminated by signal ${details.signal}`;
     case "COMMAND_TIMEOUT":
       return "timed out and was killed";
     case "COMMAND_SPAWN_FAILED":
@@ -165,6 +193,7 @@ export class CommandFailureError extends AgentLoopError {
   readonly expectedExitCodes: number[];
   readonly signal: NodeJS.Signals | null;
   readonly timedOut: boolean;
+  readonly truncated: boolean;
   readonly runId: string;
   readonly taskId: string;
   readonly stdoutTail?: string;
@@ -180,6 +209,7 @@ export class CommandFailureError extends AgentLoopError {
     this.expectedExitCodes = details.expectedExitCodes;
     this.signal = details.signal;
     this.timedOut = details.timedOut;
+    this.truncated = details.truncated;
     this.runId = details.runId;
     this.taskId = details.taskId;
     this.stdoutTail = boundedRedacted(details.stdoutTail);
@@ -195,6 +225,7 @@ export class CommandFailureError extends AgentLoopError {
       expectedExitCodes: this.expectedExitCodes,
       signal: this.signal,
       timedOut: this.timedOut,
+      truncated: this.truncated,
       runId: this.runId,
       taskId: this.taskId,
       stdoutTail: this.stdoutTail ?? null,
