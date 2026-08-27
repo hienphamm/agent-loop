@@ -155,6 +155,55 @@ Default output is a small set of operational events:
 `run_completed` / `run_failed` / `run_cancelled`. Raw model tokens
 (`model_token`) are only emitted with `--verbose-stream`.
 
+### `run_command` exit-code semantics
+
+A `run_command` action succeeds only when the process's actual exit code is
+one of its `expectedExitCodes` — **`[0]` by default**. Any other outcome
+(unexpected exit code, termination by signal, timeout, spawn failure, or
+rejection by approval policy) fails the action with a stable, structured
+error and fails the current task attempt — it never gets silently treated as
+a completed task.
+
+```ts
+// Default: only a clean exit(0) counts as success.
+{ type: "run_command", command: "npm test" }
+
+// Intentionally accept a non-zero exit, e.g. a linter that uses exit 1 to
+// mean "found issues, not a crash":
+{ type: "run_command", command: "eslint .", expectedExitCodes: [0, 1] }
+```
+
+`expectedExitCodes`, when provided, must be a non-empty array of integers in
+`0..255` (an empty array is rejected rather than silently matching every
+exit code); duplicates are normalized away. An invalid value throws
+`ActionValidationError` (`code: "INVALID_ACTION"`) before the command is ever
+run.
+
+A failed `run_command` action throws `CommandFailureError`, which carries
+structured, machine-readable fields — not just a human-readable message:
+
+```ts
+{
+  code: "UNEXPECTED_EXIT_CODE", // | "TERMINATED_BY_SIGNAL" | "COMMAND_TIMEOUT"
+                                 // | "COMMAND_SPAWN_FAILED" | "APPROVAL_REJECTED"
+  actualExitCode: 1,
+  expectedExitCodes: [0],
+  signal: null,
+  timedOut: false,
+  runId: "...",
+  taskId: "...",
+}
+```
+
+This failure goes through the same retry policy as any other task failure
+(exponential backoff, 3 attempts by default — see below), **except**
+`APPROVAL_REJECTED`: an explicit approval rejection is a deliberate policy
+decision, not a transient failure, so it fails the task attempt immediately
+instead of re-prompting for the same rejected command up to 3 times. Both
+the `command_completed` and `task_failed`/`progress` events carry the same
+structured fields, so reviewer evidence and `agent-loop logs` never depend on
+parsing English text to know a command failed.
+
 ## Resume, retry, and idempotency
 
 - Every run, task, approval, retry, conversation, and checkpoint is
@@ -163,25 +212,41 @@ Default output is a small set of operational events:
   <run-id>` picks up exactly where it left off: completed tasks are not
   re-run, in-progress state is re-derived from the database.
 - Side-effecting actions (`write_file`, `run_command`) are keyed by a
-  content hash of what they'd do. A **completed** action is never repeated —
-  the cached result is returned instead. An action that only reached
-  **attempted** (the process died mid-execution, so its real-world outcome
-  is unknown) is safe to just re-run automatically if it's `read_only`/`low`
-  risk; if it's `destructive`/`network` risk, `agent-loop` refuses to
-  silently retry it and instead raises a fresh approval (`RETRY (outcome of
-  previous attempt unknown): ...`) — see "Idempotency guarantees" below.
+  content hash of what they'd do — for `run_command`, that hash includes the
+  command, `cwd`, **and** the normalized `expectedExitCodes`, so the same
+  command under two different exit-code policies (e.g. `[0]` vs `[0, 1]`) is
+  a different identity and can never share a cached result. `[1, 0, 1]` and
+  `[0, 1]` normalize to the same identity; omitting `expectedExitCodes`
+  behaves identically to passing `[0]` explicitly.
+- A `run_command` idempotency row settles into one of three terminal-ish
+  states: **completed** (succeeded; the cached result is returned and the
+  action is never repeated), **failed** (ran to a *known* non-success —
+  unexpected exit code, signal, timeout, or spawn failure — with a bounded,
+  redacted diagnostic persisted; safe to just run again, since the outcome
+  is already certain), or **attempted** (the process died mid-execution, so
+  its real-world outcome is unknown). An **attempted** action is safe to
+  re-run automatically if it's `read_only`/`low` risk; if it's
+  `destructive`/`network` risk, `agent-loop` refuses to silently retry it
+  and instead raises a fresh approval (`RETRY (outcome of previous attempt
+  unknown): ...`) — see "Idempotency guarantees" below. A **failed** action
+  is never treated as this unknown-outcome case, regardless of risk: it just
+  re-runs like a fresh action, and the normal task retry policy decides
+  whether to keep trying.
 - An approval that was granted (or rejected) *while the process was down*
   is honored on resume instead of being asked again — resuming never
   creates a second, unanswerable approval request for the exact same action.
 - Failed tasks retry automatically (exponential backoff, 3 attempts by
-  default) unless the failure is a safety/config/auth error, or a provider
-  error explicitly classified non-retryable (e.g. a 401/403 auth failure or
-  a 400 bad request) — those are never retried, since retrying can't help.
+  default) unless the failure is a safety/config/auth/action-validation
+  error, a provider error explicitly classified non-retryable (e.g. a
+  401/403 auth failure or a 400 bad request), or a `run_command` failure
+  whose reason is `APPROVAL_REJECTED` — those are never retried, since
+  retrying can't help.
 
 ### Idempotency guarantees, precisely
 
 - **Guarantee**: the same `write_file`/`run_command` action (same task,
-  same content/command/cwd) is never executed twice once it has completed
+  same content/command/cwd, and — for `run_command` — the same normalized
+  `expectedExitCodes`) is never executed twice once it has completed
   successfully once, across any number of crashes/resumes.
 - **Not guaranteed**: that the *command itself* is idempotent in the real
   world. `agent-loop` cannot know whether `curl -X POST .../charge` is safe

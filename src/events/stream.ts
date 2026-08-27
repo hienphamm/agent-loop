@@ -35,11 +35,20 @@ const HUMAN_SUMMARY: Partial<
   task_started: (e) =>
     `task ${e.taskId} started: ${String(e.data.description ?? "")}`,
   command_started: (e) => `  $ ${String(e.data.command ?? "")}`,
-  command_completed: (e) =>
-    `  (exit ${String(e.data.exitCode ?? "?")}) ${String(e.data.command ?? "")}`,
+  command_completed: (e) => {
+    const outcome = e.data.signal
+      ? `signal ${String(e.data.signal)}`
+      : `exit ${String(e.data.exitCode ?? "?")}`;
+    const base = `  (${outcome}) ${String(e.data.command ?? "")}`;
+    if (e.data.success === false) {
+      return `${base} FAILED [${String(e.data.failureReason ?? "?")}] expected=${JSON.stringify(e.data.expectedExitCodes ?? [])}`;
+    }
+    return base;
+  },
   progress: (e) => `... ${String(e.data.message ?? "")}`,
   task_completed: (e) => `task ${e.taskId} completed`,
-  task_failed: (e) => `task ${e.taskId} FAILED: ${String(e.data.error ?? "")}`,
+  task_failed: (e) =>
+    `task ${e.taskId} FAILED [${String(e.data.code ?? "UNKNOWN_ERROR")}]: ${String(e.data.error ?? "")}`,
   review_result: (e) =>
     `review: ${String(e.data.decision ?? "")} ${String(e.data.notes ?? "")}`,
   context_compacted: (e) =>

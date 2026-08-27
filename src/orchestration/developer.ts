@@ -1,17 +1,33 @@
 import type { ContextManager } from "../context/manager.js";
 import type { Executor } from "../execution/executor.js";
+import { normalizeExpectedExitCodes } from "../execution/executor.js";
 import { ProviderError } from "../errors/index.js";
 import type { ProviderAdapter } from "../providers/types.js";
 import type { Task } from "./types.js";
 
 export type DeveloperAction =
-  | { type: "run_command"; command: string; cwd?: string }
+  | {
+      type: "run_command";
+      command: string;
+      cwd?: string;
+      /**
+       * Exit codes this command may return without the action (and the
+       * enclosing task attempt) being treated as failed. Defaults to `[0]`
+       * — a clean exit — when omitted, so existing callers that don't set
+       * this keep getting the safer default rather than silently accepting
+       * every exit code. Set this explicitly to accept an intentional
+       * non-zero exit, e.g. `expectedExitCodes: [0, 1]` for a linter that
+       * uses 1 to mean "found issues".
+       */
+      expectedExitCodes?: number[];
+    }
   | { type: "write_file"; path: string; content: string };
 
 export interface DeveloperActionResult {
   action: DeveloperAction;
   output?: string;
   exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
 }
 
 /**
@@ -36,11 +52,13 @@ export class DeveloperAgent {
           task.id,
           action.command,
           action.cwd,
+          action.expectedExitCodes,
         );
         results.push({
           action,
           output: `${result.stdout}${result.stderr}`.slice(0, 4000),
           exitCode: result.exitCode,
+          signal: result.signal,
         });
       } else {
         await this.executor.writeFile(task.id, action.path, action.content);
@@ -104,10 +122,17 @@ function parseActions(raw: string): DeveloperAction[] {
         content: String(a.content ?? ""),
       };
     }
+    // Validated eagerly (not deferred to Executor.runCommand) so a malformed
+    // action fails before any approval prompt or process spawn — fail fast,
+    // per action's DX requirements.
+    const expectedExitCodes = normalizeExpectedExitCodes(
+      a.expectedExitCodes as ReadonlyArray<unknown> | undefined,
+    );
     return {
       type: "run_command",
       command: String(a.command ?? ""),
       cwd: a.cwd ? String(a.cwd) : undefined,
+      expectedExitCodes,
     };
   });
 }

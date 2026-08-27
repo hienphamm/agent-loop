@@ -407,11 +407,24 @@ export class Repository {
   // "network" risk: `getIdempotencyState` surfaces that ambiguity so the
   // caller can require a fresh approval instead of guessing. "read_only"
   // and "low" risk actions are safe to just re-run.
+  //
+  // A third terminal state, "failed", covers a *known* outcome that did not
+  // succeed (unexpected exit code, signal, timeout, spawn failure): unlike
+  // "attempted", the caller already knows exactly what happened, so it is
+  // never confused for an unknown-outcome crash and never requires the
+  // forced-approval retry path — it's just safe to run again like a fresh
+  // action. `status` has no CHECK constraint in the schema (plain TEXT), so
+  // adding this value requires no migration; existing "attempted"/
+  // "completed" rows from before this value existed remain valid as-is.
 
   getIdempotencyState(
     key: string,
   ):
-    | { status: "attempted" | "completed"; risk: string; result: unknown }
+    | {
+        status: "attempted" | "completed" | "failed";
+        risk: string;
+        result: unknown;
+      }
     | undefined {
     const row = this.db
       .prepare(
@@ -419,7 +432,7 @@ export class Repository {
       )
       .get(key) as
       | {
-          status: "attempted" | "completed";
+          status: "attempted" | "completed" | "failed";
           risk: string;
           result_json: string | null;
         }
@@ -448,7 +461,7 @@ export class Repository {
       .run(key, runId, taskId, risk, key, ts, ts);
   }
 
-  /** Record the confirmed result once execution completes. */
+  /** Record the confirmed result once execution completes successfully. */
   recordIdempotentResult(
     key: string,
     runId: string,
@@ -467,6 +480,39 @@ export class Repository {
         taskId,
         risk,
         JSON.stringify(redactDeep(result)),
+        key,
+        now(),
+        now(),
+      );
+  }
+
+  /**
+   * Record a *known* terminal failure (not a crash): the command actually
+   * ran and finished (or definitively failed to spawn/timed out/was
+   * signaled), so the outcome is certain. Distinguished from "attempted" so
+   * a retry never treats this as an unknown-outcome crash requiring forced
+   * approval, and never returns it as a cached success. `failure` should be
+   * a bounded, redacted diagnostic (see `CommandFailureError`); it is
+   * redacted again here defensively before being persisted.
+   */
+  recordIdempotentFailure(
+    key: string,
+    runId: string,
+    taskId: string,
+    risk: string,
+    failure: unknown,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO idempotency_keys (key, run_id, task_id, risk, status, result_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'failed', ?, COALESCE((SELECT created_at FROM idempotency_keys WHERE key = ?), ?), ?)`,
+      )
+      .run(
+        key,
+        runId,
+        taskId,
+        risk,
+        JSON.stringify(redactDeep(failure)),
         key,
         now(),
         now(),

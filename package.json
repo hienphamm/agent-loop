@@ -1,5 +1,5 @@
 {
-  "name": "agent-loop",
+  "name": "@hienphamm/agent-loop",
   "version": "0.1.0",
   "description": "CLI-first, local-only orchestrator for a Planner/Reviewer and Developer/Executor agent loop.",
   "type": "module",

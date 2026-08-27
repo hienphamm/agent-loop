@@ -14,7 +14,10 @@ import { openInMemoryDatabase } from "../../src/persistence/db.js";
 import { Repository } from "../../src/persistence/repository.js";
 import { EventBus } from "../../src/events/bus.js";
 import { ApprovalGate } from "../../src/execution/approval.js";
-import { Executor } from "../../src/execution/executor.js";
+import {
+  Executor,
+  computeRunCommandIdempotencyKey,
+} from "../../src/execution/executor.js";
 import { WorkspaceSafetyError } from "../../src/errors/index.js";
 
 function makeWorkspace(name = "agent-loop-exec-safety-"): string {
@@ -195,22 +198,26 @@ describe("Executor idempotency + retry safety", () => {
     );
 
     // Manually pre-seed an "attempted" (crashed) state for this exact command
-    // by hashing the same way Executor does internally: we can't reach the
-    // private hash function, so instead we drive it through a first call
-    // that we truncate by inspecting recordIdempotentAttempt directly via a
-    // white-box run: call runCommand once and confirm a completed row exists,
-    // then simulate "attempted-only" by recording a fresh attempt for a
-    // different (never-completed) destructive command and re-running it.
+    // by computing the same idempotency identity Executor uses internally:
+    // we can't reach the private hash function, so instead we drive it
+    // through a first call that we truncate by inspecting
+    // recordIdempotentAttempt directly via a white-box run: call runCommand
+    // once and confirm a completed row exists, then simulate
+    // "attempted-only" by recording a fresh attempt for a different
+    // (never-completed) destructive command and re-running it.
     await executor.runCommand("t1", command); // succeeds, records "completed"
 
     // Now prove the *attempted-but-not-completed* path via a distinct
     // destructive command we control end-to-end using the repository API
-    // with the same hashing scheme Executor uses (sha256 of the same parts).
-    const { createHash } = await import("node:crypto");
+    // with the same idempotency identity Executor computes internally
+    // (same command/cwd/expectedExitCodes -> same key).
     const crashedCommand = "rm -rf never-finished";
-    const crashedKey = createHash("sha256")
-      .update(["run_command", "run-1", "t1", crashedCommand, ""].join(" "))
-      .digest("hex");
+    const crashedKey = computeRunCommandIdempotencyKey(
+      "run-1",
+      "t1",
+      crashedCommand,
+      undefined,
+    );
     repository.recordIdempotentAttempt(
       crashedKey,
       "run-1",

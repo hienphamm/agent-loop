@@ -101,7 +101,11 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   task_id TEXT NOT NULL,
   risk TEXT NOT NULL DEFAULT 'low',
   -- 'attempted': execution started but outcome is unknown (crash mid-flight).
-  -- 'completed': execution finished and result_json is authoritative.
+  -- 'completed': execution finished successfully; result_json is the cached result.
+  -- 'failed': execution finished with a known (non-crash) failure; result_json
+  --   holds a bounded, redacted failure diagnostic, not a successful result.
+  -- No CHECK constraint on this column by design, so adding 'failed' needed
+  -- no migration; pre-existing 'attempted'/'completed' rows are unaffected.
   status TEXT NOT NULL DEFAULT 'attempted',
   result_json TEXT,
   created_at TEXT NOT NULL,

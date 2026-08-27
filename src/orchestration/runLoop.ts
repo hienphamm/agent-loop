@@ -2,7 +2,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { discoverAgentsMd } from "../agentsMd/discover.js";
 import type { AgentLoopConfig } from "../config/schema.js";
-import { AgentLoopError } from "../errors/index.js";
+import {
+  AgentLoopError,
+  CommandFailureError,
+  toDisplayError,
+} from "../errors/index.js";
 import { ApprovalGate } from "../execution/approval.js";
 import { Executor } from "../execution/executor.js";
 import type { EventBus } from "../events/bus.js";
@@ -353,7 +357,23 @@ async function runTaskWithRetry(
       events.emit({ runId, taskId, type: "task_completed", data: {} });
       return true;
     } catch (error) {
-      const message = (error as Error).message;
+      const display = toDisplayError(error);
+      const message = display.message;
+      // Structured, machine-readable evidence of *why* a run_command action
+      // failed (stable code + actualExitCode/signal/timedOut/expected), so
+      // reviewer evidence and event logs never depend on parsing `message`.
+      const failureDetails: Record<string, unknown> =
+        error instanceof CommandFailureError
+          ? {
+              code: error.code,
+              reason: error.reason,
+              command: error.command,
+              actualExitCode: error.actualExitCode,
+              expectedExitCodes: error.expectedExitCodes,
+              signal: error.signal,
+              timedOut: error.timedOut,
+            }
+          : { code: display.code };
       if (
         !isRetryableError(error) ||
         attempt >= DEFAULT_RETRY_POLICY.maxAttempts
@@ -363,7 +383,7 @@ async function runTaskWithRetry(
           runId,
           taskId,
           type: "task_failed",
-          data: { error: message, attempt },
+          data: { error: message, attempt, ...failureDetails },
         });
         return false;
       }
@@ -382,6 +402,7 @@ async function runTaskWithRetry(
         type: "progress",
         data: {
           message: `retrying after error: ${message} (attempt ${attempt}, waiting ${delay}ms)`,
+          ...failureDetails,
         },
       });
       await sleep(delay);

@@ -7,14 +7,175 @@ import type { Repository } from "../persistence/repository.js";
 import { classifyCommand, type CommandRisk } from "./commandSafety.js";
 import { assertWorkspaceRootValid, resolveWorkspacePath } from "./workspace.js";
 import type { ApprovalGate } from "./approval.js";
-import { WorkspaceSafetyError } from "../errors/index.js";
+import {
+  ActionValidationError,
+  CommandFailureError,
+  WorkspaceSafetyError,
+  type CommandFailureReason,
+} from "../errors/index.js";
 import { sanitizedChildEnv } from "../util/childEnv.js";
 
 export interface CommandResult {
   exitCode: number | null;
+  /** Non-null when the process was terminated by a signal rather than exiting normally. */
+  signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
   truncated?: boolean;
+  /** True when the soft timeout fired and the process was killed for running too long. */
+  timedOut?: boolean;
+}
+
+/** Default `expectedExitCodes` for a `run_command` action when the caller omits it: only a clean exit(0) counts as success. */
+export const DEFAULT_EXPECTED_EXIT_CODES: readonly number[] = [0];
+
+/** Valid POSIX/Node child-process exit code range. */
+const MIN_EXIT_CODE = 0;
+const MAX_EXIT_CODE = 255;
+
+/**
+ * Validates and normalizes a `run_command` action's `expectedExitCodes`.
+ * - `undefined` -> defaults to `[0]` (the safe default: only a clean exit succeeds).
+ * - Must be a non-empty array of integers in `[0, 255]` when provided explicitly
+ *   (an empty array would accept nothing, which is almost certainly not what
+ *   was intended, so it is rejected rather than silently accepting nothing —
+ *   or, worse, being misread as "accept anything").
+ * - Duplicates are normalized away (deduped + sorted) rather than rejected.
+ *
+ * Throws {@link ActionValidationError} — a non-retryable, actionable error —
+ * on anything else, so a malformed action fails fast instead of running the
+ * command and only failing (or worse, "succeeding") afterward.
+ */
+export function normalizeExpectedExitCodes(
+  codes: ReadonlyArray<unknown> | undefined,
+): number[] {
+  if (codes === undefined) return [...DEFAULT_EXPECTED_EXIT_CODES];
+  if (!Array.isArray(codes) || codes.length === 0) {
+    throw new ActionValidationError(
+      "expectedExitCodes must be a non-empty array of integers when provided",
+      'Omit expectedExitCodes to use the default [0], or provide at least one exit code, e.g. "expectedExitCodes": [0, 1].',
+    );
+  }
+  const seen = new Set<number>();
+  for (const raw of codes) {
+    if (
+      typeof raw !== "number" ||
+      !Number.isInteger(raw) ||
+      raw < MIN_EXIT_CODE ||
+      raw > MAX_EXIT_CODE
+    ) {
+      throw new ActionValidationError(
+        `expectedExitCodes must contain integers in the range ${MIN_EXIT_CODE}-${MAX_EXIT_CODE}; got ${JSON.stringify(raw)}`,
+        'Use a real process exit code, e.g. "expectedExitCodes": [0, 1].',
+      );
+    }
+    seen.add(raw);
+  }
+  return [...seen].sort((a, b) => a - b);
+}
+
+/** Classifies a finished command's outcome against its accepted exit codes. */
+function classifyOutcome(
+  result: CommandResult,
+  expectedExitCodes: number[],
+): { success: true } | { success: false; reason: CommandFailureReason } {
+  if (result.timedOut) return { success: false, reason: "COMMAND_TIMEOUT" };
+  if (result.signal)
+    return { success: false, reason: "TERMINATED_BY_SIGNAL" };
+  if (result.exitCode !== null && expectedExitCodes.includes(result.exitCode))
+    return { success: true };
+  return { success: false, reason: "UNEXPECTED_EXIT_CODE" };
+}
+
+/**
+ * The idempotency identity for a `run_command` action must include its
+ * normalized `expectedExitCodes`: the exact same command can be an accepted
+ * success under one policy (`[0, 1]`) and a failure under another (`[0]`),
+ * so a cached result from one policy must never answer for the other.
+ * `normalizedExpectedExitCodes` is expected already-normalized (deduped +
+ * sorted), so equivalent inputs like `[1, 0, 1]` and `[0, 1]` hash identically.
+ */
+function hashRunCommandKey(
+  runId: string,
+  taskId: string,
+  command: string,
+  cwd: string | undefined,
+  normalizedExpectedExitCodes: number[],
+): string {
+  return hashKey(
+    "run_command",
+    runId,
+    taskId,
+    command,
+    cwd ?? "",
+    JSON.stringify(normalizedExpectedExitCodes),
+  );
+}
+
+/**
+ * Computes the same idempotency identity `Executor.runCommand` uses for a
+ * given (task, command, cwd, expectedExitCodes) tuple. Exposed only from
+ * this module (not re-exported from the package root) for tests/tooling
+ * that need to inspect a persisted idempotency row directly — it is not
+ * part of the supported public API.
+ */
+export function computeRunCommandIdempotencyKey(
+  runId: string,
+  taskId: string,
+  command: string,
+  cwd: string | undefined,
+  expectedExitCodes?: number[],
+): string {
+  return hashRunCommandKey(
+    runId,
+    taskId,
+    command,
+    cwd,
+    normalizeExpectedExitCodes(expectedExitCodes),
+  );
+}
+
+function hashWriteFileKey(
+  runId: string,
+  taskId: string,
+  relPath: string,
+  content: string,
+): string {
+  return hashKey("write_file", runId, taskId, relPath, content);
+}
+
+/**
+ * Computes the same idempotency identity `Executor.writeFile` uses for a
+ * given (task, path, content) tuple. Exposed only from this module (not
+ * re-exported from the package root) for tests/tooling that need to inspect
+ * a persisted idempotency row directly — it is not part of the supported
+ * public API.
+ */
+export function computeWriteFileIdempotencyKey(
+  runId: string,
+  taskId: string,
+  relPath: string,
+  content: string,
+): string {
+  return hashWriteFileKey(runId, taskId, relPath, content);
+}
+
+/**
+ * Bounded, redacted, structured diagnostic persisted for a known command
+ * failure. Built from a {@link CommandFailureError}, whose own fields are
+ * already bounded/redacted, so this is a plain field-by-field projection
+ * (the repository layer redacts once more, defensively, before writing it).
+ */
+function failureDiagnostic(error: CommandFailureError): Record<string, unknown> {
+  return {
+    code: error.code,
+    actualExitCode: error.actualExitCode,
+    expectedExitCodes: error.expectedExitCodes,
+    signal: error.signal,
+    timedOut: error.timedOut,
+    stdoutTail: error.stdoutTail ?? null,
+    stderrTail: error.stderrTail ?? null,
+  };
 }
 
 export interface ExecutorOptions {
@@ -70,8 +231,7 @@ export class Executor {
   ): Promise<void> {
     // Validated once up front so path traversal fails fast even on a cache hit.
     resolveWorkspacePath(this.assertWorkspaceStillValid(), relPath);
-    const idempotencyKey = hashKey(
-      "write_file",
+    const idempotencyKey = hashWriteFileKey(
       this.runId,
       taskId,
       relPath,
@@ -128,21 +288,34 @@ export class Executor {
     );
   }
 
+  /**
+   * Runs a shell command. By default only a clean `exit 0` counts as
+   * success — pass `expectedExitCodes` to accept other codes intentionally
+   * (e.g. `[0, 1]` for a linter that uses 1 to mean "found issues"). Any
+   * outcome outside that set — an unexpected exit code, termination by
+   * signal, a timeout, a spawn failure, or rejection by approval policy —
+   * throws a {@link CommandFailureError} instead of returning a result, so a
+   * failed command can never be silently treated as a completed task.
+   */
   async runCommand(
     taskId: string,
     command: string,
     cwd?: string,
+    expectedExitCodes?: number[],
   ): Promise<CommandResult> {
+    const normalizedExpectedExitCodes = normalizeExpectedExitCodes(
+      expectedExitCodes,
+    );
     const root = this.assertWorkspaceStillValid();
     const workingDir = cwd ? resolveWorkspacePath(root, cwd) : root;
     const classification = classifyCommand(command);
 
-    const idempotencyKey = hashKey(
-      "run_command",
+    const idempotencyKey = hashRunCommandKey(
       this.runId,
       taskId,
       command,
-      cwd ?? "",
+      cwd,
+      normalizedExpectedExitCodes,
     );
     const cached = this.checkCache(
       idempotencyKey,
@@ -155,6 +328,7 @@ export class Executor {
       return (
         (cached.result as CommandResult) ?? {
           exitCode: null,
+          signal: null,
           stdout: "",
           stderr: "",
         }
@@ -181,11 +355,29 @@ export class Executor {
       forceManual: cached.requiresApprovalBeforeRetry,
     });
     if (!approved) {
-      return {
-        exitCode: null,
-        stdout: "",
-        stderr: "rejected by approval policy",
-      };
+      this.events.emit({
+        runId: this.runId,
+        taskId,
+        type: "command_completed",
+        data: {
+          command,
+          exitCode: null,
+          signal: null,
+          success: false,
+          failureReason: "APPROVAL_REJECTED",
+          expectedExitCodes: normalizedExpectedExitCodes,
+        },
+      });
+      throw new CommandFailureError({
+        reason: "APPROVAL_REJECTED",
+        command,
+        actualExitCode: null,
+        expectedExitCodes: normalizedExpectedExitCodes,
+        signal: null,
+        timedOut: false,
+        runId: this.runId,
+        taskId,
+      });
     }
 
     this.events.emit({
@@ -200,9 +392,9 @@ export class Executor {
         runId: this.runId,
         taskId,
         type: "command_completed",
-        data: { command, exitCode: 0, dryRun: true },
+        data: { command, exitCode: 0, success: true, dryRun: true },
       });
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return { exitCode: 0, signal: null, stdout: "", stderr: "" };
     }
 
     this.repository.recordIdempotentAttempt(
@@ -211,7 +403,53 @@ export class Executor {
       taskId,
       classification.risk,
     );
-    const result = await this.spawnShell(command, workingDir);
+
+    let result: CommandResult;
+    try {
+      result = await this.spawnShell(command, workingDir);
+    } catch (error) {
+      const spawnMessage = (error as Error).message;
+      this.events.emit({
+        runId: this.runId,
+        taskId,
+        type: "command_completed",
+        data: {
+          command,
+          exitCode: null,
+          signal: null,
+          success: false,
+          failureReason: "COMMAND_SPAWN_FAILED",
+          expectedExitCodes: normalizedExpectedExitCodes,
+        },
+      });
+      const failureError = new CommandFailureError(
+        {
+          reason: "COMMAND_SPAWN_FAILED",
+          command,
+          actualExitCode: null,
+          expectedExitCodes: normalizedExpectedExitCodes,
+          signal: null,
+          timedOut: false,
+          runId: this.runId,
+          taskId,
+        },
+        spawnMessage,
+      );
+      // A spawn failure is a *known* outcome (the OS told us exactly why),
+      // not a crash of this process — persist it distinctly so a retry
+      // re-runs it plainly instead of being treated as an unknown-outcome
+      // crash that forces a fresh approval.
+      this.repository.recordIdempotentFailure(
+        idempotencyKey,
+        this.runId,
+        taskId,
+        classification.risk,
+        failureDiagnostic(failureError),
+      );
+      throw failureError;
+    }
+
+    const outcome = classifyOutcome(result, normalizedExpectedExitCodes);
     this.events.emit({
       runId: this.runId,
       taskId,
@@ -219,18 +457,45 @@ export class Executor {
       data: {
         command,
         exitCode: result.exitCode,
+        signal: result.signal,
+        timedOut: result.timedOut ?? false,
         truncated: result.truncated ?? false,
+        expectedExitCodes: normalizedExpectedExitCodes,
+        success: outcome.success,
+        ...(outcome.success ? {} : { failureReason: outcome.reason }),
       },
     });
-    if (result.exitCode === 0) {
-      this.repository.recordIdempotentResult(
+
+    if (!outcome.success) {
+      const failureError = new CommandFailureError({
+        reason: outcome.reason,
+        command,
+        actualExitCode: result.exitCode,
+        expectedExitCodes: normalizedExpectedExitCodes,
+        signal: result.signal,
+        timedOut: result.timedOut ?? false,
+        runId: this.runId,
+        taskId,
+        stdoutTail: result.stdout,
+        stderrTail: result.stderr,
+      });
+      this.repository.recordIdempotentFailure(
         idempotencyKey,
         this.runId,
         taskId,
         classification.risk,
-        result,
+        failureDiagnostic(failureError),
       );
+      throw failureError;
     }
+
+    this.repository.recordIdempotentResult(
+      idempotencyKey,
+      this.runId,
+      taskId,
+      classification.risk,
+      result,
+    );
     return result;
   }
 
@@ -273,6 +538,15 @@ export class Executor {
       return { skip: true, result: state.result };
     }
 
+    // status === "failed": a previous attempt ran to a *known* conclusion
+    // that didn't succeed (unexpected exit code, signal, timeout, spawn
+    // failure) — the outcome is certain, so it's neither cached as success
+    // nor treated as an unknown-outcome crash. Just let it run again like a
+    // fresh action; the normal retry policy decides whether to keep trying.
+    if (state.status === "failed") {
+      return { skip: false };
+    }
+
     // status === "attempted": a previous run started this and we never
     // learned the outcome (crash, kill -9, power loss). Re-running a
     // read-only/low-risk action is safe; re-running something classified
@@ -305,10 +579,11 @@ export class Executor {
       let stderr = "";
       let outputBytes = 0;
       let truncated = false;
+      let timedOut = false;
       let settled = false;
       let hardKillTimer: NodeJS.Timeout | undefined;
       const softTimer = setTimeout(() => {
-        truncated = truncated || false;
+        timedOut = true;
         child.kill("SIGTERM");
         hardKillTimer = setTimeout(() => child.kill("SIGKILL"), killGraceMs);
       }, softTimeoutMs);
@@ -349,17 +624,36 @@ export class Executor {
         if (hardKillTimer) clearTimeout(hardKillTimer);
         reject(error);
       });
-      child.on("close", (exitCode) => {
+      child.on("close", (exitCode, signal) => {
         if (settled) return;
         settled = true;
         clearTimeout(softTimer);
         if (hardKillTimer) clearTimeout(hardKillTimer);
-        resolve({ exitCode, stdout, stderr, truncated });
+        resolve({ exitCode, signal, stdout, stderr, truncated, timedOut });
       });
     });
   }
 }
 
+/**
+ * Hashes an ordered tuple of fields into a single idempotency identity.
+ *
+ * Encoded via `JSON.stringify(parts)` rather than `parts.join(" ")`:
+ * joining with a plain separator loses field boundaries, so distinct
+ * tuples can collide whenever a separator character appears inside a
+ * field — e.g. `["exit 0", "a b"]` and `["exit 0 a", "b"]` both join to
+ * `"exit 0 a b"`. JSON-encoding each element (with its own quoting/
+ * escaping) makes the boundary between fields unambiguous, so only
+ * genuinely identical tuples can hash the same.
+ *
+ * This is the second time the encoding has changed (the first added
+ * `expectedExitCodes` as an extra field); each change makes idempotency
+ * rows written under the old encoding unreachable under the new one — they
+ * are simply orphaned (a fresh run treats the action as never-seen and
+ * executes it normally), never misread as a stale success. No migration is
+ * needed since `idempotency_keys.key` has no format constraint, only a
+ * PRIMARY KEY uniqueness constraint on whatever string is stored.
+ */
 function hashKey(...parts: string[]): string {
-  return createHash("sha256").update(parts.join(" ")).digest("hex");
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }

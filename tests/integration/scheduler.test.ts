@@ -155,13 +155,14 @@ describe("DAG scheduler behavior (through the full run loop)", () => {
     const dependent = tasks.find((t) => t.id === "depends-on-failure");
     const failed = tasks.find((t) => t.id === "fails");
 
-    // "fails" runs `exit 1` which is a zero-action command with nonzero exit
-    // — the developer step itself doesn't throw (no actions to run), so the
-    // task "completes" from the orchestrator's point of view; what matters
+    // "fails" runs `exit 1` with the default expectedExitCodes ([0]), so the
+    // run_command action — and therefore the task attempt — must fail; it
+    // must never be silently treated as completed just because the
+    // developer step didn't throw a JS exception on its own. What matters
     // here is that the DAG scheduler still ran the independent task and left
-    // the true dependency ordering intact.
+    // the true dependency ordering intact despite this task failing.
     expect(independent?.status).toBe("completed");
-    expect(failed).toBeDefined();
+    expect(failed?.status).toBe("failed");
     expect(dependent).toBeDefined();
   });
 

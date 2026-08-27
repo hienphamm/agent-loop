@@ -24,13 +24,22 @@ export function isRetryableError(error: unknown): boolean {
   if (
     name === "WorkspaceSafetyError" ||
     name === "ConfigError" ||
-    name === "AuthError"
+    name === "AuthError" ||
+    name === "ActionValidationError"
   ) {
     return false;
   }
   if (name === "ProviderError") {
     // Explicit per-error classification (timeout/429/5xx vs. 4xx auth/bad request).
     return (error as { retryable?: boolean }).retryable !== false;
+  }
+  if (name === "CommandFailureError") {
+    // APPROVAL_REJECTED is an explicit human/policy decision, not a
+    // transient process failure — retrying can't change it and would just
+    // re-prompt for the same rejected action. Every other reason
+    // (UNEXPECTED_EXIT_CODE, TERMINATED_BY_SIGNAL, COMMAND_TIMEOUT,
+    // COMMAND_SPAWN_FAILED) keeps the normal retry policy.
+    return (error as { reason?: string }).reason !== "APPROVAL_REJECTED";
   }
   return true;
 }
