@@ -4,6 +4,22 @@
   "description": "CLI-first, local-only orchestrator for a Planner/Reviewer and Developer/Executor agent loop.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hienphamm/agent-loop.git"
+  },
+  "homepage": "https://github.com/hienphamm/agent-loop#readme",
+  "bugs": {
+    "url": "https://github.com/hienphamm/agent-loop/issues"
+  },
+  "keywords": [
+    "cli",
+    "agent",
+    "orchestrator",
+    "planner",
+    "executor",
+    "llm"
+  ],
   "engines": {
     "node": ">=22.5.0"
   },
