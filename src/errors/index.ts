@@ -81,14 +81,49 @@ export class ProviderError extends AgentLoopError {
 }
 
 /**
+ * Stable, machine-readable sub-codes for {@link ActionValidationError},
+ * distinguishing *why* an action was rejected without callers needing to
+ * parse `message`. The top-level `code` stays `"INVALID_ACTION"` for
+ * backward compatibility; `validationCode` narrows it further.
+ */
+export type ActionValidationCode =
+  | "UNKNOWN_ACTION_TYPE"
+  | "UNKNOWN_FIELD"
+  | "MALFORMED_ACTION"
+  | "MISSING_FIELD"
+  | "INVALID_FIELD";
+
+/**
  * A `run_command`/other developer-agent action referenced a malformed or
- * unsafe property (e.g. an invalid `expectedExitCodes`). Raised before the
- * action is ever executed, so retrying without changing the action can't help.
+ * unsafe property (e.g. an invalid `expectedExitCodes`), an unknown action
+ * type, or an unrecognized field. Raised before the action is ever executed
+ * (before filesystem mutation, approval, or process spawn), so retrying
+ * without changing the action can't help.
  */
 export class ActionValidationError extends AgentLoopError {
-  constructor(message: string, hint?: string) {
+  readonly validationCode: ActionValidationCode;
+  readonly details?: readonly string[];
+
+  constructor(
+    message: string,
+    hint?: string,
+    options?: {
+      validationCode?: ActionValidationCode;
+      details?: readonly string[];
+    },
+  ) {
     super("INVALID_ACTION", message, { hint });
     this.name = "ActionValidationError";
+    this.validationCode = options?.validationCode ?? "MALFORMED_ACTION";
+    this.details = options?.details;
+  }
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      validationCode: this.validationCode,
+      details: this.details ?? null,
+    };
   }
 }
 

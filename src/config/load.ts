@@ -82,6 +82,10 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadConfigResult {
     stateDir: path.resolve(cwd, env.AGENT_LOOP_STATE_DIR ?? ".agent-loop"),
     contextTokenBudget: numberOr(env.AGENT_LOOP_CONTEXT_TOKEN_BUDGET, 100_000),
     maxReviewRounds: numberOr(env.AGENT_LOOP_MAX_REVIEW_ROUNDS, 3),
+    maxDeveloperActions: optionalNumber(env.AGENT_LOOP_MAX_DEVELOPER_ACTIONS),
+    developerActionWallTimeMs: optionalNumber(
+      env.AGENT_LOOP_DEVELOPER_ACTION_WALL_TIME_MS,
+    ),
     reviewer: {
       provider: reviewerProvider ?? "",
       model: overrides.reviewerModel ?? env.AGENT_LOOP_REVIEWER_MODEL ?? "",
@@ -152,6 +156,12 @@ function numberOr(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function optionalNumber(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 function warnEnvFileNotIgnored(

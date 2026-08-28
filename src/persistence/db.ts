@@ -120,6 +120,26 @@ CREATE TABLE IF NOT EXISTS run_locks (
   heartbeat_at TEXT NOT NULL
 );
 
+-- P2: durable log of each iterative-loop Developer action. A row is
+-- inserted (status='requested') before the action executes and updated
+-- (status='completed'|'failed') before the next model turn, so an action
+-- request/result is durable independent of whether the run-level task row
+-- has been marked completed yet. Purely additive (CREATE TABLE IF NOT
+-- EXISTS): an existing state.db simply gains this table on next open, no
+-- ALTER needed, and older rows/tables are untouched.
+CREATE TABLE IF NOT EXISTS developer_actions (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  action_json TEXT NOT NULL,
+  status TEXT NOT NULL, -- 'requested' | 'completed' | 'failed'
+  result_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_developer_actions_seq ON developer_actions(run_id, task_id, seq);
+
 CREATE TABLE IF NOT EXISTS memory (
   id TEXT PRIMARY KEY,
   run_id TEXT,

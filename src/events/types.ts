@@ -15,6 +15,7 @@ export type OperationalEventType =
   | "progress"
   | "task_completed"
   | "task_failed"
+  | "task_blocked"
   | "review_result"
   | "context_compacted"
   | "run_completed"

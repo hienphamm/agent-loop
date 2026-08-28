@@ -204,6 +204,76 @@ the `command_completed` and `task_failed`/`progress` events carry the same
 structured fields, so reviewer evidence and `agent-loop logs` never depend on
 parsing English text to know a command failed.
 
+## Developer tool loop and typed actions (P2)
+
+The Developer/Executor runs a bounded, iterative tool loop: each turn the
+provider requests **exactly one** typed action, the Executor runs it, and the
+sanitized result is persisted and fed back into the same conversation before
+the next turn. The loop ends when the Developer returns `done` or `blocked`,
+or when a configured budget is exceeded.
+
+```json
+{"action": {"type": "read_file", "path": "src/index.ts"}}
+{"action": {"type": "list_files", "path": "src", "maxResults": 200}}
+{"action": {"type": "search_text", "query": "TODO", "path": "src", "caseSensitive": false}}
+{"action": {"type": "run_command", "command": "npm test", "expectedExitCodes": [0]}}
+{"action": {"type": "write_file", "path": "src/index.ts", "content": "..."}}
+{"action": {"type": "done", "changedFiles": ["src/index.ts"], "requestedChecks": ["npm test"], "skippedChecks": [], "blockers": [], "assumptions": [], "architecturalDecisions": []}}
+{"action": {"type": "blocked", "reason": "MISSING_INFORMATION", "detail": "no target file was specified"}}
+```
+
+**Backward compatibility**: the pre-P2 one-shot shape,
+`{"actions": [<typed action>, ...]}` (no `done`/`blocked` inside the list), is
+still fully supported — every action in the list runs, then the task
+completes as if a `done` had been returned, with `changedFiles` derived from
+the `write_file` actions that ran. Existing callers require no changes.
+
+**Read-only actions** (`read_file`, `list_files`, `search_text`) are
+confined to the workspace boundary exactly like `write_file`/`run_command`
+(traversal and symlink-escape rejected), bounded (result count, matches,
+bytes read/scanned — see `execution/executor.ts` for the exact limits), and
+redacted before being persisted, logged, or sent back to the provider.
+`search_text` is a literal (non-regex) substring search implemented in pure
+JS — it never invokes a shell.
+
+**Validation**: every action is validated by a strict schema (unknown action
+types and unknown fields are rejected) *before* any filesystem mutation,
+approval prompt, or process spawn. A malformed action throws
+`ActionValidationError` with a `validationCode` of `UNKNOWN_ACTION_TYPE`,
+`UNKNOWN_FIELD`, `MALFORMED_ACTION`, or `MISSING_FIELD`, plus a `details`
+array of the specific issues.
+
+**Command evidence**: a `run_command` action's success/failure is decided
+solely by the Executor's actual exit code (same semantics as before P2) — a
+Developer can never report a command as having succeeded; `done`'s
+`changedFiles`/checks fields are the Developer's own claims, recorded as-is
+for the Reviewer (independent reconciliation against a Git delta is P3 work).
+
+**Limits**: `maxDeveloperActions` (default 25) and
+`developerActionWallTimeMs` (default 10 minutes, for the whole task loop, not
+per action) bound the loop. Exceeding either produces a durable `blocked`
+outcome (`reason: "ACTION_LIMIT_EXCEEDED"` / `"WALL_TIME_EXCEEDED"`) — never
+an infinite loop. Configure via `AGENT_LOOP_MAX_DEVELOPER_ACTIONS` /
+`AGENT_LOOP_DEVELOPER_ACTION_WALL_TIME_MS`, or the `maxDeveloperActions`/
+`developerActionWallTimeMs` config fields (both optional; omitted means the
+conservative defaults apply).
+
+**Durability**: each action request is persisted (`developer_actions` table)
+before it executes, and each result is persisted before the next model turn.
+This is a genuinely new SQLite table, added via `CREATE TABLE IF NOT EXISTS`
+— an existing `state.db` gains it automatically on next open, no migration
+step required.
+
+**Slice-1 scope and deferred work** (tracked in `ROADMAP.md`):
+`apply_patch`, full crash-mid-task resume of the provider conversation, token
+budgets, and richer per-turn output budgets are **not** part of this slice.
+What *is* durable today: the action request/result log itself, and — via the
+Executor's existing idempotency keys — real replay protection for
+`write_file`/`run_command` (a repeated identical request after a crash is a
+no-op, not a double execution). What resume does **not** yet do: reconstruct
+a crashed task's in-flight provider conversation — a resumed task starts a
+fresh Developer conversation for that task rather than continuing mid-turn.
+
 ## Resume, retry, and idempotency
 
 - Every run, task, approval, retry, conversation, and checkpoint is

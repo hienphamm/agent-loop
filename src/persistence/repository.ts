@@ -5,6 +5,7 @@ import type {
   ApprovalRecord,
   CheckpointRecord,
   ConversationRecord,
+  DeveloperActionRecord,
   MemoryRecord,
   RetryRecord,
   Run,
@@ -417,9 +418,7 @@ export class Repository {
   // adding this value requires no migration; existing "attempted"/
   // "completed" rows from before this value existed remain valid as-is.
 
-  getIdempotencyState(
-    key: string,
-  ):
+  getIdempotencyState(key: string):
     | {
         status: "attempted" | "completed" | "failed";
         risk: string;
@@ -477,8 +476,7 @@ export class Repository {
         resultUsable = false;
       }
     }
-    const knownStatus =
-      row.status === "completed" || row.status === "failed";
+    const knownStatus = row.status === "completed" || row.status === "failed";
     const status: "attempted" | "completed" | "failed" =
       knownStatus && !(row.status === "completed" && !resultUsable)
         ? (row.status as "completed" | "failed")
@@ -611,6 +609,79 @@ export class Repository {
       pid: row.pid as number,
       acquiredAt: row.acquired_at as string,
     };
+  }
+
+  // ---- developer actions (P2 iterative loop durability) ------------------
+  //
+  // Durability boundary for the iterative Developer loop: the action
+  // request is persisted before it executes, and the result is persisted
+  // before the next model turn. This log records what happened; it does
+  // NOT by itself replay/resume a mid-task provider conversation (that
+  // remains a documented P2 slice-2 gap — see ROADMAP.md). Side-effecting
+  // actions (`write_file`/`run_command`) additionally get real replay
+  // protection from the Executor's own idempotency keys.
+
+  recordDeveloperActionRequest(
+    runId: string,
+    taskId: string,
+    seq: number,
+    action: unknown,
+  ): string {
+    const id = randomUUID();
+    const ts = now();
+    // INSERT OR REPLACE (keyed on the (run_id, task_id, seq) unique index):
+    // a task retry re-runs `DeveloperAgent.run` from `seq = 1`, so the same
+    // tuple is legitimately re-requested after an earlier attempt failed —
+    // this log records the latest attempt's request/result, not a full
+    // cross-attempt history.
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO developer_actions (id, run_id, task_id, seq, action_json, status, result_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'requested', NULL, ?, ?)`,
+      )
+      .run(id, runId, taskId, seq, JSON.stringify(redactDeep(action)), ts, ts);
+    return id;
+  }
+
+  recordDeveloperActionResult(
+    runId: string,
+    taskId: string,
+    seq: number,
+    status: "completed" | "failed",
+    result: unknown,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE developer_actions SET status = ?, result_json = ?, updated_at = ?
+         WHERE run_id = ? AND task_id = ? AND seq = ?`,
+      )
+      .run(
+        status,
+        JSON.stringify(redactDeep(result)),
+        now(),
+        runId,
+        taskId,
+        seq,
+      );
+  }
+
+  listDeveloperActions(runId: string, taskId: string): DeveloperActionRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM developer_actions WHERE run_id = ? AND task_id = ? ORDER BY seq ASC`,
+      )
+      .all(runId, taskId) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: r.id as string,
+      runId: r.run_id as string,
+      taskId: r.task_id as string,
+      seq: r.seq as number,
+      action: JSON.parse(r.action_json as string),
+      status: r.status as DeveloperActionRecord["status"],
+      result: r.result_json ? JSON.parse(r.result_json as string) : undefined,
+      createdAt: r.created_at as string,
+      updatedAt: r.updated_at as string,
+    }));
   }
 
   // ---- memory ------------------------------------------------------------

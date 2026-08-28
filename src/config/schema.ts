@@ -25,6 +25,15 @@ export const AgentLoopConfigSchema = z.object({
   contextTokenBudget: z.number().int().positive(),
   maxReviewRounds: z.number().int().positive(),
   stateDir: z.string().min(1),
+  /**
+   * Bounds on the iterative Developer tool loop (P2). Optional so existing
+   * `AgentLoopConfig` literals (tests, callers built before P2) keep
+   * compiling unchanged; `DeveloperAgent`/`runLoop` fall back to
+   * `DEFAULT_MAX_DEVELOPER_ACTIONS`/`DEFAULT_DEVELOPER_WALL_TIME_MS` from
+   * `orchestration/developer.js` when unset.
+   */
+  maxDeveloperActions: z.number().int().positive().optional(),
+  developerActionWallTimeMs: z.number().int().positive().optional(),
 });
 export type AgentLoopConfig = z.infer<typeof AgentLoopConfigSchema>;
 

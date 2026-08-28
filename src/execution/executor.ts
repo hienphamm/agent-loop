@@ -1,6 +1,12 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import type { EventBus } from "../events/bus.js";
 import type { Repository } from "../persistence/repository.js";
@@ -13,6 +19,7 @@ import {
   WorkspaceSafetyError,
   type CommandFailureReason,
 } from "../errors/index.js";
+import { redact } from "../auth/redact.js";
 import { sanitizedChildEnv } from "../util/childEnv.js";
 
 export interface CommandResult {
@@ -28,6 +35,52 @@ export interface CommandResult {
 
 /** Default `expectedExitCodes` for a `run_command` action when the caller omits it: only a clean exit(0) counts as success. */
 export const DEFAULT_EXPECTED_EXIT_CODES: readonly number[] = [0];
+
+/** Read-only action bounds — deliberately conservative so a single Developer turn's evidence stays small and deterministic. */
+export const DEFAULT_LIST_FILES_LIMIT = 500;
+export const MAX_LIST_FILES_LIMIT = 2000;
+export const DEFAULT_SEARCH_MATCHES_LIMIT = 200;
+export const MAX_SEARCH_MATCHES_LIMIT = 1000;
+/** Max bytes read from a single file by `read_file`; the rest is dropped and `truncated: true` is reported instead of silently growing context. */
+export const MAX_READ_FILE_BYTES = 1_000_000;
+/** Files larger than this are skipped by `search_text` rather than read fully into memory. */
+export const MAX_SEARCH_FILE_BYTES = 2_000_000;
+/** Hard cap on filesystem entries visited by one `list_files`/`search_text` call, independent of the result limit, so a huge tree can't make a bounded-result call unboundedly slow. */
+export const MAX_ENTRIES_SCANNED = 20_000;
+/** Max characters kept per matched line in a `search_text` result. */
+const MAX_MATCH_LINE_CHARS = 500;
+
+export interface FileEntry {
+  /** Workspace-relative, POSIX-separated path. */
+  path: string;
+  type: "file" | "directory";
+}
+
+export interface ListFilesResult {
+  entries: FileEntry[];
+  /** True if the scan stopped early (result or scan-node limit reached) — the entries list is not the complete tree. */
+  truncated: boolean;
+}
+
+export interface SearchMatch {
+  /** Workspace-relative, POSIX-separated path. */
+  path: string;
+  /** 1-based line number. */
+  line: number;
+  /** Redacted, length-bounded line text. */
+  text: string;
+}
+
+export interface SearchTextResult {
+  matches: SearchMatch[];
+  truncated: boolean;
+}
+
+export interface ReadFileResult {
+  path: string;
+  content: string;
+  truncated: boolean;
+}
 
 /** Valid POSIX/Node child-process exit code range. */
 const MIN_EXIT_CODE = 0;
@@ -80,8 +133,7 @@ function classifyOutcome(
   expectedExitCodes: number[],
 ): { success: true } | { success: false; reason: CommandFailureReason } {
   if (result.timedOut) return { success: false, reason: "COMMAND_TIMEOUT" };
-  if (result.signal)
-    return { success: false, reason: "TERMINATED_BY_SIGNAL" };
+  if (result.signal) return { success: false, reason: "TERMINATED_BY_SIGNAL" };
   if (result.exitCode !== null && expectedExitCodes.includes(result.exitCode))
     return { success: true };
   return { success: false, reason: "UNEXPECTED_EXIT_CODE" };
@@ -166,7 +218,9 @@ export function computeWriteFileIdempotencyKey(
  * already bounded/redacted, so this is a plain field-by-field projection
  * (the repository layer redacts once more, defensively, before writing it).
  */
-function failureDiagnostic(error: CommandFailureError): Record<string, unknown> {
+function failureDiagnostic(
+  error: CommandFailureError,
+): Record<string, unknown> {
   return {
     code: error.code,
     actualExitCode: error.actualExitCode,
@@ -256,9 +310,192 @@ export class Executor {
     this.workspaceRoot = assertWorkspaceRootValid(workspaceRoot);
   }
 
-  readFile(taskId: string, relPath: string): string {
+  /**
+   * Reads a workspace file, confined to the workspace boundary (traversal
+   * and symlink-escape protected, same as `writeFile`). Bounded to
+   * {@link MAX_READ_FILE_BYTES} and redacted before being returned — this is
+   * evidence fed back to the model, so it must never carry a secret past
+   * this boundary.
+   */
+  readFile(taskId: string, relPath: string): ReadFileResult {
     const abs = resolveWorkspacePath(this.assertWorkspaceStillValid(), relPath);
-    return readFileSync(abs, "utf8");
+    const buf = readFileSync(abs);
+    const truncated = buf.length > MAX_READ_FILE_BYTES;
+    const content = redact(
+      buf.subarray(0, MAX_READ_FILE_BYTES).toString("utf8"),
+    );
+    return { path: relPath, content, truncated };
+  }
+
+  /**
+   * Lists files/directories under `relDir` (default: workspace root),
+   * confined to the workspace boundary. Ordering is a name-sorted
+   * depth-first walk, which — since the path separator sorts before
+   * ordinary filename characters — coincides with a full lexicographic sort
+   * of the resulting relative paths, so results are deterministic across
+   * runs and across platforms with the same tree. Bounded by both a result
+   * count (`maxResults`) and a hard scan-node cap
+   * ({@link MAX_ENTRIES_SCANNED}), so a huge tree can't make a bounded call
+   * unboundedly slow. A directory entry whose real path escapes the
+   * workspace (a symlink pointing outside) is skipped rather than followed
+   * or thrown on, so a single hostile symlink can't abort an otherwise
+   * useful listing.
+   */
+  listFiles(
+    taskId: string,
+    relDir: string | undefined,
+    maxResults?: number,
+  ): ListFilesResult {
+    const root = this.assertWorkspaceStillValid();
+    const startAbs = resolveWorkspacePath(root, relDir ?? ".");
+    const limit = Math.min(
+      maxResults ?? DEFAULT_LIST_FILES_LIMIT,
+      MAX_LIST_FILES_LIMIT,
+    );
+
+    const entries: FileEntry[] = [];
+    let scanned = 0;
+    let truncated = false;
+
+    const walk = (dirAbs: string): void => {
+      if (truncated) return;
+      let dirents;
+      try {
+        dirents = readdirSync(dirAbs, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      const sorted = [...dirents].sort((a, b) => a.name.localeCompare(b.name));
+      for (const dirent of sorted) {
+        if (entries.length >= limit || scanned >= MAX_ENTRIES_SCANNED) {
+          truncated = true;
+          return;
+        }
+        const childAbs = path.join(dirAbs, dirent.name);
+        const relFromRoot = path.relative(root, childAbs);
+        let resolvedAbs: string;
+        try {
+          resolvedAbs = resolveWorkspacePath(root, relFromRoot);
+        } catch {
+          continue; // symlink (or similar) escapes the workspace — skip, don't abort
+        }
+        scanned += 1;
+        const isDir = dirent.isSymbolicLink()
+          ? safeIsDirectory(resolvedAbs)
+          : dirent.isDirectory();
+        entries.push({
+          path: toPosixPath(relFromRoot),
+          type: isDir ? "directory" : "file",
+        });
+        if (isDir) walk(childAbs);
+      }
+    };
+    walk(startAbs);
+
+    return { entries, truncated };
+  }
+
+  /**
+   * Literal (non-regex) text search under `relDir` (default: workspace
+   * root). Pure-JS line scan — never invokes a shell — over the same
+   * deterministic, workspace-confined file walk as {@link listFiles}.
+   * Bounded by `maxMatches`, {@link MAX_ENTRIES_SCANNED} files scanned, and
+   * a per-file size cap ({@link MAX_SEARCH_FILE_BYTES}, larger files are
+   * skipped rather than partially read). Matched lines are redacted and
+   * length-capped before being returned.
+   */
+  searchText(
+    taskId: string,
+    query: string,
+    options: {
+      relDir?: string;
+      maxMatches?: number;
+      caseSensitive?: boolean;
+    } = {},
+  ): SearchTextResult {
+    const root = this.assertWorkspaceStillValid();
+    const startAbs = resolveWorkspacePath(root, options.relDir ?? ".");
+    const limit = Math.min(
+      options.maxMatches ?? DEFAULT_SEARCH_MATCHES_LIMIT,
+      MAX_SEARCH_MATCHES_LIMIT,
+    );
+    const caseSensitive = options.caseSensitive ?? true;
+    const needle = caseSensitive ? query : query.toLowerCase();
+
+    const matches: SearchMatch[] = [];
+    let scanned = 0;
+    let truncated = false;
+
+    const searchFile = (fileAbs: string, relFromRoot: string): void => {
+      let stat;
+      try {
+        stat = statSync(fileAbs);
+      } catch {
+        return;
+      }
+      if (stat.size > MAX_SEARCH_FILE_BYTES) return;
+      let text: string;
+      try {
+        text = readFileSync(fileAbs, "utf8");
+      } catch {
+        return; // not readable as text (binary, permissions, race) — skip
+      }
+      const lines = text.split("\n");
+      for (let i = 0; i < lines.length; i += 1) {
+        if (matches.length >= limit) {
+          truncated = true;
+          return;
+        }
+        const line = lines[i]!;
+        const haystack = caseSensitive ? line : line.toLowerCase();
+        if (haystack.includes(needle)) {
+          const bounded =
+            line.length > MAX_MATCH_LINE_CHARS
+              ? `${line.slice(0, MAX_MATCH_LINE_CHARS)}…`
+              : line;
+          matches.push({
+            path: toPosixPath(relFromRoot),
+            line: i + 1,
+            text: redact(bounded),
+          });
+        }
+      }
+    };
+
+    const walk = (dirAbs: string): void => {
+      if (truncated) return;
+      let dirents;
+      try {
+        dirents = readdirSync(dirAbs, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      const sorted = [...dirents].sort((a, b) => a.name.localeCompare(b.name));
+      for (const dirent of sorted) {
+        if (matches.length >= limit || scanned >= MAX_ENTRIES_SCANNED) {
+          truncated = true;
+          return;
+        }
+        const childAbs = path.join(dirAbs, dirent.name);
+        const relFromRoot = path.relative(root, childAbs);
+        let resolvedAbs: string;
+        try {
+          resolvedAbs = resolveWorkspacePath(root, relFromRoot);
+        } catch {
+          continue;
+        }
+        scanned += 1;
+        const isDir = dirent.isSymbolicLink()
+          ? safeIsDirectory(resolvedAbs)
+          : dirent.isDirectory();
+        if (isDir) walk(childAbs);
+        else searchFile(childAbs, relFromRoot);
+        if (truncated) return;
+      }
+    };
+    walk(startAbs);
+
+    return { matches, truncated };
   }
 
   async writeFile(
@@ -342,9 +579,8 @@ export class Executor {
     cwd?: string,
     expectedExitCodes?: number[],
   ): Promise<CommandResult> {
-    const normalizedExpectedExitCodes = normalizeExpectedExitCodes(
-      expectedExitCodes,
-    );
+    const normalizedExpectedExitCodes =
+      normalizeExpectedExitCodes(expectedExitCodes);
     const root = this.assertWorkspaceStillValid();
     const workingDir = cwd ? resolveWorkspacePath(root, cwd) : root;
     const classification = classifyCommand(command);
@@ -719,4 +955,18 @@ export class Executor {
  */
 function hashKey(...parts: string[]): string {
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+}
+
+/** `statSync` that reports "not a directory" instead of throwing on a broken symlink or race. */
+function safeIsDirectory(abs: string): boolean {
+  try {
+    return statSync(abs).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Normalizes a `path.relative` result to POSIX separators for a stable, cross-platform action-result shape. */
+function toPosixPath(relPath: string): string {
+  return relPath.split(path.sep).join("/");
 }

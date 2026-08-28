@@ -116,6 +116,24 @@ export interface CheckpointRecord {
   createdAt: string;
 }
 
+/**
+ * Durable log row for one iterative-loop Developer action (P2). `status`
+ * moves from `"requested"` (persisted before execution) to `"completed"` or
+ * `"failed"` (persisted before the next model turn) — see
+ * `Repository.recordDeveloperActionRequest`/`recordDeveloperActionResult`.
+ */
+export interface DeveloperActionRecord {
+  id: string;
+  runId: string;
+  taskId: string;
+  seq: number;
+  action: unknown;
+  status: "requested" | "completed" | "failed";
+  result?: unknown;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type MemoryKind = "decision" | "fact" | "rule" | "artifact";
 
 export interface MemoryRecord {

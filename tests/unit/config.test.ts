@@ -110,4 +110,44 @@ describe("loadConfig", () => {
       true,
     );
   });
+
+  it("leaves maxDeveloperActions/developerActionWallTimeMs undefined by default (DeveloperAgent applies its own conservative defaults)", () => {
+    const cwd = makeTmpDir();
+    const { config } = loadConfig({
+      cwd,
+      env: {
+        AGENT_LOOP_REVIEWER_PROVIDER: "openai",
+        AGENT_LOOP_REVIEWER_MODEL: "gpt",
+        AGENT_LOOP_REVIEWER_AUTH: "api_key",
+        AGENT_LOOP_REVIEWER_API_KEY: "sk-reviewer-123456",
+        AGENT_LOOP_DEVELOPER_PROVIDER: "anthropic",
+        AGENT_LOOP_DEVELOPER_MODEL: "claude",
+        AGENT_LOOP_DEVELOPER_AUTH: "api_key",
+        AGENT_LOOP_DEVELOPER_API_KEY: "sk-developer-123456",
+      },
+    });
+    expect(config.maxDeveloperActions).toBeUndefined();
+    expect(config.developerActionWallTimeMs).toBeUndefined();
+  });
+
+  it("reads maxDeveloperActions/developerActionWallTimeMs from the environment", () => {
+    const cwd = makeTmpDir();
+    const { config } = loadConfig({
+      cwd,
+      env: {
+        AGENT_LOOP_REVIEWER_PROVIDER: "openai",
+        AGENT_LOOP_REVIEWER_MODEL: "gpt",
+        AGENT_LOOP_REVIEWER_AUTH: "api_key",
+        AGENT_LOOP_REVIEWER_API_KEY: "sk-reviewer-123456",
+        AGENT_LOOP_DEVELOPER_PROVIDER: "anthropic",
+        AGENT_LOOP_DEVELOPER_MODEL: "claude",
+        AGENT_LOOP_DEVELOPER_AUTH: "api_key",
+        AGENT_LOOP_DEVELOPER_API_KEY: "sk-developer-123456",
+        AGENT_LOOP_MAX_DEVELOPER_ACTIONS: "10",
+        AGENT_LOOP_DEVELOPER_ACTION_WALL_TIME_MS: "5000",
+      },
+    });
+    expect(config.maxDeveloperActions).toBe(10);
+    expect(config.developerActionWallTimeMs).toBe(5000);
+  });
 });

@@ -49,6 +49,8 @@ const HUMAN_SUMMARY: Partial<
   task_completed: (e) => `task ${e.taskId} completed`,
   task_failed: (e) =>
     `task ${e.taskId} FAILED [${String(e.data.code ?? "UNKNOWN_ERROR")}]: ${String(e.data.error ?? "")}`,
+  task_blocked: (e) =>
+    `task ${e.taskId} BLOCKED [${String(e.data.reason ?? "?")}]: ${String(e.data.detail ?? "")}`,
   review_result: (e) =>
     `review: ${String(e.data.decision ?? "")} ${String(e.data.notes ?? "")}`,
   context_compacted: (e) =>

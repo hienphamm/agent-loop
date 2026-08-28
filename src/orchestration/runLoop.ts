@@ -14,7 +14,11 @@ import { ContextManager } from "../context/manager.js";
 import type { Repository } from "../persistence/repository.js";
 import type { ProviderAdapter } from "../providers/types.js";
 import { TaskDag } from "./dag.js";
-import { DeveloperAgent } from "./developer.js";
+import {
+  DEFAULT_DEVELOPER_WALL_TIME_MS,
+  DEFAULT_MAX_DEVELOPER_ACTIONS,
+  DeveloperAgent,
+} from "./developer.js";
 import { PlannerReviewerAgent } from "./plannerReviewer.js";
 import {
   backoffDelay,
@@ -148,7 +152,9 @@ export async function runOrchestration(options: RunLoopOptions): Promise<Run> {
       if (isCancelled()) continue;
 
       const tasks = repository.listTasks(run.id);
-      const anyFailed = tasks.some((t) => t.status === "failed");
+      const anyFailed = tasks.some(
+        (t) => t.status === "failed" || t.status === "blocked",
+      );
 
       repository.updateRunStatus(run.id, "reviewing");
       const reviewDecision = await reviewPhase(run.id, options, tasks, round);
@@ -316,6 +322,14 @@ async function executePhase(
           config.developer.model,
           context,
           executor,
+          repository,
+          {
+            maxActions:
+              config.maxDeveloperActions ?? DEFAULT_MAX_DEVELOPER_ACTIONS,
+            wallTimeMs:
+              config.developerActionWallTimeMs ??
+              DEFAULT_DEVELOPER_WALL_TIME_MS,
+          },
         );
 
         const ok = await runTaskWithRetry(runId, spec.id, options, developer);
@@ -351,8 +365,32 @@ async function runTaskWithRetry(
   let attempt = task.retryCount + 1;
   for (;;) {
     try {
-      const results = await developer.run(task);
-      repository.setTaskResult(runId, taskId, results);
+      const runResult = await developer.run(task);
+      repository.setTaskResult(runId, taskId, runResult);
+
+      if (runResult.outcome.status === "blocked") {
+        // BLOCKED is a terminal, non-retryable task outcome: the Developer
+        // has explicitly said it cannot proceed, with a machine-readable
+        // reason and actionable detail — retrying without new information
+        // would just reproduce the same block.
+        repository.updateTaskStatus(
+          runId,
+          taskId,
+          "blocked",
+          `${runResult.outcome.reason}: ${runResult.outcome.detail}`,
+        );
+        events.emit({
+          runId,
+          taskId,
+          type: "task_blocked",
+          data: {
+            reason: runResult.outcome.reason,
+            detail: runResult.outcome.detail,
+          },
+        });
+        return false;
+      }
+
       repository.updateTaskStatus(runId, taskId, "completed");
       events.emit({ runId, taskId, type: "task_completed", data: {} });
       return true;

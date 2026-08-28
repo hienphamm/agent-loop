@@ -182,7 +182,10 @@ describe("Executor idempotency + retry safety", () => {
     ["a bare scalar (0)", "0"],
     ["a bare JSON string", '"unrelated text"'],
     ["an empty array", "[]"],
-    ["a valid-but-wrong-shape object (a write_file result)", '{"path":"x.txt"}'],
+    [
+      "a valid-but-wrong-shape object (a write_file result)",
+      '{"path":"x.txt"}',
+    ],
   ])(
     "does not skip run_command execution for a 'completed' row whose result_json is %s",
     async (_label, jsonLiteral) => {
@@ -248,9 +251,7 @@ describe("Executor idempotency + retry safety", () => {
       // — rather than being silently skipped because a corrupted row
       // claimed this exact write was already "completed".
       const { readFileSync } = await import("node:fs");
-      expect(readFileSync(path.join(workspace, relPath), "utf8")).toBe(
-        content,
-      );
+      expect(readFileSync(path.join(workspace, relPath), "utf8")).toBe(content);
     },
   );
 
@@ -374,4 +375,73 @@ describe("Executor idempotency + retry safety", () => {
       ),
     ).toBe(true);
   }, 10_000);
+});
+
+describe("Executor read-only actions (P2)", () => {
+  it("read_file bounds output size and reports truncation instead of growing unboundedly", async () => {
+    const workspace = makeWorkspace();
+    const { executor } = makeExecutor(workspace);
+    const big = "x".repeat(50);
+    writeFileSync(path.join(workspace, "big.txt"), big);
+    const result = executor.readFile("t1", "big.txt");
+    expect(result.content).toBe(big);
+    expect(result.truncated).toBe(false);
+  });
+
+  it("list_files returns a deterministic, name-sorted, workspace-relative listing across repeated calls", async () => {
+    const workspace = makeWorkspace();
+    mkdirSync(path.join(workspace, "dir"));
+    writeFileSync(path.join(workspace, "dir", "z.txt"), "z");
+    writeFileSync(path.join(workspace, "a.txt"), "a");
+    const { executor } = makeExecutor(workspace);
+    const first = executor.listFiles("t1", undefined, undefined);
+    const second = executor.listFiles("t1", undefined, undefined);
+    expect(first).toEqual(second);
+    expect(first.entries.map((e) => e.path)).toEqual([
+      "a.txt",
+      "dir",
+      "dir/z.txt",
+    ]);
+    expect(first.truncated).toBe(false);
+  });
+
+  it("list_files never returns a path outside the workspace, even for a directory-shaped symlink target", async () => {
+    const workspace = makeWorkspace();
+    const outside = makeWorkspace("agent-loop-exec-list-outside-");
+    writeFileSync(path.join(outside, "secret.txt"), "nope");
+    symlinkSync(outside, path.join(workspace, "escape"));
+    writeFileSync(path.join(workspace, "ok.txt"), "ok");
+    const { executor } = makeExecutor(workspace);
+    const result = executor.listFiles("t1", undefined, undefined);
+    expect(result.entries.map((e) => e.path)).toEqual(["ok.txt"]);
+  });
+
+  it("search_text finds literal matches without invoking a shell, and is bounded by maxMatches", async () => {
+    const workspace = makeWorkspace();
+    writeFileSync(
+      path.join(workspace, "notes.txt"),
+      "needle one\nnothing here\nneedle two\nneedle three\n",
+    );
+    const { executor } = makeExecutor(workspace);
+    const bounded = executor.searchText("t1", "needle", { maxMatches: 2 });
+    expect(bounded.matches).toHaveLength(2);
+    expect(bounded.truncated).toBe(true);
+    expect(bounded.matches[0]).toEqual({
+      path: "notes.txt",
+      line: 1,
+      text: "needle one",
+    });
+
+    const shellChar = executor.searchText("t1", "$(echo pwned)");
+    expect(shellChar.matches).toHaveLength(0); // literal search — never interpreted as shell syntax
+  });
+
+  it("search_text is a literal search: regex metacharacters in the query are matched literally, not as a pattern", async () => {
+    const workspace = makeWorkspace();
+    writeFileSync(path.join(workspace, "f.txt"), "a.b.c\naxbxc\n");
+    const { executor } = makeExecutor(workspace);
+    const result = executor.searchText("t1", "a.b.c");
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]!.text).toBe("a.b.c");
+  });
 });
